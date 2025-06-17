@@ -1,7 +1,6 @@
 ---
 title: "Improved Modeling for Churn Prediction"
 author: "Andres Perez"
-date: "`r Sys.Date()`"
 output:
   html_document:
     toc: true
