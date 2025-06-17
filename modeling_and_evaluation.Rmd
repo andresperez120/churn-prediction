@@ -1,0 +1,219 @@
+---
+title: "Model Creation and Evaluation for Churn Prediction"
+author: "Andres Perez"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+
+# Check and install required packages if needed
+required_packages <- c("tidyverse", "caret", "randomForest", "xgboost", "pROC", "ROCR", "e1071")
+new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+
+# Load required libraries
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(pROC)
+library(ROCR)
+library(e1071)
+```
+
+# Model Creation and Evaluation for Churn Prediction
+
+This document covers the process of building, tuning, and evaluating predictive models for customer churn. We will use the features engineered in the previous step and compare different modeling approaches.
+
+## 1. Data Loading and Preparation
+
+```{r load_data}
+# Load the engineered features data
+# Update the path if needed
+data <- read.csv("data/EngineeredChurnData.csv")
+
+# Print column names for diagnostics
+print("Columns in loaded data:")
+print(colnames(data))
+
+# Prepare data for modeling (handle NAs, etc.)
+# Identify numeric columns (excluding Churn)
+numeric_cols <- sapply(data, is.numeric) & names(data) != "Churn"
+# Remove numeric columns with all NA or zero variance
+keep_numeric <- sapply(data[, numeric_cols, drop=FALSE], function(x) !all(is.na(x)) && sd(x, na.rm=TRUE) > 0)
+keep_cols <- intersect(c(names(data)[numeric_cols][keep_numeric], "Churn"), colnames(data))
+data_clean <- data[, keep_cols, drop=FALSE]
+
+# Remove rows with any NA, NaN, or Inf values
+data_clean <- data_clean[complete.cases(data_clean) & apply(data_clean, 1, function(row) all(is.finite(as.numeric(row)))), ]
+
+# Ensure Churn is a factor for classification
+if("Churn" %in% colnames(data_clean) && !is.factor(data_clean$Churn)) {
+  data_clean$Churn <- as.factor(data_clean$Churn)
+}
+
+# Check class balance
+if("Churn" %in% colnames(data_clean)) table(data_clean$Churn)
+
+# Use only the top 10 features (plus Churn) for modeling
+selected_features <- c(
+  "Customer.Months",
+  "Days.Since.Last.Login",
+  "CHI.Score.Mon0",
+  "Activity_Score",
+  "CHI.Score",
+  "Logins",
+  "Views_log",
+  "Logins_log",
+  "Views",
+  "Login_View_Interaction",
+  "Churn"
+)
+selected_features <- intersect(selected_features, colnames(data_clean))
+data_model <- data_clean[, selected_features, drop=FALSE]
+```
+
+## 2. Train-Test Split
+
+```{r split_data}
+set.seed(123)
+train_index <- createDataPartition(data_model$Churn, p = 0.8, list = FALSE)
+train_data <- data_model[train_index, ]
+test_data <- data_model[-train_index, ]
+```
+
+## 3. Baseline Model: Logistic Regression
+
+```{r baseline_logistic}
+logit_model <- glm(Churn ~ ., data = train_data, family = binomial)
+summary(logit_model)
+
+# Predict on test set
+logit_pred <- predict(logit_model, newdata = test_data, type = "response")
+logit_pred_class <- ifelse(logit_pred > 0.5, 1, 0)
+
+# Evaluate
+confusionMatrix(as.factor(logit_pred_class), test_data$Churn, positive = "1")
+roc_logit <- roc(as.numeric(test_data$Churn), as.numeric(logit_pred))
+plot(roc_logit, main = "ROC Curve - Logistic Regression")
+auc(roc_logit)
+```
+
+## 4. Random Forest Model
+
+```{r random_forest}
+rf_model <- randomForest(Churn ~ ., data = train_data, importance = TRUE, ntree = 200)
+rf_pred <- predict(rf_model, newdata = test_data, type = "response")
+
+# Evaluate
+confusionMatrix(rf_pred, test_data$Churn, positive = "1")
+roc_rf <- roc(as.numeric(test_data$Churn), as.numeric(rf_pred))
+plot(roc_rf, main = "ROC Curve - Random Forest")
+auc(roc_rf)
+
+# Feature importance plot
+varImpPlot(rf_model)
+```
+
+## 5. XGBoost Model
+
+```{r xgboost}
+# Prepare data for xgboost (numeric matrix, 0/1 labels)
+xgb_train <- train_data %>% mutate(Churn = as.numeric(as.character(Churn)))
+xgb_test <- test_data %>% mutate(Churn = as.numeric(as.character(Churn)))
+train_matrix <- as.matrix(xgb_train %>% select(-Churn))
+test_matrix <- as.matrix(xgb_test %>% select(-Churn))
+train_label <- xgb_train$Churn
+
+dtrain <- xgb.DMatrix(data = train_matrix, label = train_label)
+dtest <- xgb.DMatrix(data = test_matrix)
+
+params <- list(objective = "binary:logistic", eval_metric = "auc")
+xgb_model <- xgboost(params = params, data = dtrain, nrounds = 100, verbose = 0)
+xgb_pred <- predict(xgb_model, dtest)
+xgb_pred_class <- ifelse(xgb_pred > 0.5, 1, 0)
+
+# Evaluate
+confusionMatrix(as.factor(xgb_pred_class), as.factor(xgb_test$Churn), positive = "1")
+roc_xgb <- roc(xgb_test$Churn, xgb_pred)
+plot(roc_xgb, main = "ROC Curve - XGBoost")
+auc(roc_xgb)
+```
+
+## 6. Model Comparison
+
+```{r model_comparison}
+# Compare ROC curves
+ggroc(list(Logistic = roc_logit, RF = roc_rf, XGBoost = roc_xgb)) +
+  labs(title = "ROC Curve Comparison")
+
+# Summarize AUCs
+auc_df <- data.frame(
+  Model = c("Logistic Regression", "Random Forest", "XGBoost"),
+  AUC = c(auc(roc_logit), auc(roc_rf), auc(roc_xgb))
+)
+knitr::kable(auc_df, digits = 3, caption = "AUC Comparison Across Models")
+```
+
+## 7. Model Metrics Summary
+
+```{r model_metrics_summary}
+# Calculate metrics for each model
+# Logistic Regression
+logit_cm <- confusionMatrix(as.factor(logit_pred_class), test_data$Churn, positive = "1")
+logit_sens <- logit_cm$byClass["Sensitivity"]
+logit_spec <- logit_cm$byClass["Specificity"]
+logit_f1 <- logit_cm$byClass["F1"]
+logit_auc <- auc(roc_logit)
+
+# Random Forest
+rf_cm <- confusionMatrix(rf_pred, test_data$Churn, positive = "1")
+rf_sens <- rf_cm$byClass["Sensitivity"]
+rf_spec <- rf_cm$byClass["Specificity"]
+rf_f1 <- rf_cm$byClass["F1"]
+rf_auc <- auc(roc_rf)
+
+# XGBoost
+xgb_cm <- confusionMatrix(as.factor(xgb_pred_class), as.factor(xgb_test$Churn), positive = "1")
+xgb_sens <- xgb_cm$byClass["Sensitivity"]
+xgb_spec <- xgb_cm$byClass["Specificity"]
+xgb_f1 <- xgb_cm$byClass["F1"]
+xgb_auc <- auc(roc_xgb)
+
+# Combine into a summary table
+metrics_df <- data.frame(
+  Model = c("Logistic Regression", "Random Forest", "XGBoost"),
+  Sensitivity = c(logit_sens, rf_sens, xgb_sens),
+  Specificity = c(logit_spec, rf_spec, xgb_spec),
+  F1 = c(logit_f1, rf_f1, xgb_f1),
+  AUC = c(logit_auc, rf_auc, xgb_auc)
+)
+
+knitr::kable(metrics_df, digits = 3, caption = "Sensitivity, Specificity, F1, and AUC for Each Baseline Model")
+```
+
+## 8. Next Steps
+
+- Address class imbalance if needed (e.g., SMOTE, class weights, resampling)
+- Tune hyperparameters for best-performing models
+- Try additional models or ensembling
+- Interpret and communicate results
+- Prepare for deployment if satisfied with performance
+
+## Conclusion
+
+In this analysis, we compared several models for predicting customer churn using our top engineered features. XGBoost performed the best with an AUC of 0.71, showing some ability to distinguish churners from non-churners. However, all models struggled to correctly identify most churners, mainly due to strong class imbalance in the data. 
+
+To improve results, the next steps should focus on addressing class imbalance and further tuning the models to increase recall for churners. Overall, our feature engineering and modeling pipeline provides a solid foundation, but more work is needed to achieve strong predictive performance for churn. 

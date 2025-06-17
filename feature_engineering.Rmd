@@ -1,0 +1,342 @@
+---
+title: "Feature Engineering for Churn Prediction"
+author: "Andres Perez"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+
+# Check and install required packages if needed
+required_packages <- c("tidyverse", "caret", "corrplot", "randomForest", "ggplot2")
+new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+
+# Load required libraries
+library(tidyverse)
+library(caret)
+library(corrplot)
+library(randomForest)
+library(ggplot2)
+```
+
+# Feature Engineering for Churn Prediction
+
+This document outlines the feature engineering process for the churn prediction model. We'll explore various transformations and create new features to improve model performance.
+
+## Data Loading and Initial Setup
+
+```{r load_data}
+# Load the data
+data <- read.csv("data/ChurnData.csv")
+
+# Display initial structure
+str(data)
+
+# Display first few rows
+head(data)
+
+# Summary statistics
+summary(data)
+```
+
+## Feature Engineering Process
+
+### 1. Numeric Feature Transformations
+
+The goal of numeric feature transformations is to improve the predictive power of our model by:
+1. Handling skewed distributions that could bias our model
+2. Creating meaningful ratios that capture customer engagement patterns
+3. Identifying interaction effects between different customer behaviors
+4. Normalizing metrics by customer tenure to enable fair comparisons
+
+```{r numeric_transformations}
+# Create a copy of the data for transformations
+data_transformed <- data
+
+# Log transformations for skewed numeric variables
+# These transformations help normalize right-skewed distributions of engagement metrics
+# and make the relationships more linear, which is beneficial for many modeling techniques
+data_transformed$Logins_log <- log1p(data_transformed$Logins)
+data_transformed$Views_log <- log1p(data_transformed$Views)
+data_transformed$Blog.Articles_log <- log1p(data_transformed$Blog.Articles)
+
+# Create ratio features
+# These ratios help identify customers who are more engaged relative to their login frequency
+# A high ratio might indicate more valuable customers who make the most of each login
+data_transformed$Views_per_Login <- ifelse(data_transformed$Logins > 0, 
+                                         data_transformed$Views / data_transformed$Logins, 
+                                         0)
+
+data_transformed$Blog_per_Login <- ifelse(data_transformed$Logins > 0, 
+                                        data_transformed$Blog.Articles / data_transformed$Logins, 
+                                        0)
+
+# Create interaction features
+# These interactions help capture combined effects of different customer behaviors
+# For example, the relationship between support cases and CHI score might be different
+# for customers with different engagement levels
+data_transformed$Support_Score_Interaction <- data_transformed$Support.Cases * data_transformed$CHI.Score
+data_transformed$Login_View_Interaction <- data_transformed$Logins * data_transformed$Views
+
+# Create time-based features
+# This normalizes engagement metrics by customer tenure to enable fair comparisons
+# between customers who have been with the service for different lengths of time
+data_transformed$Activity_Score <- (data_transformed$Logins + data_transformed$Views + 
+                                  data_transformed$Blog.Articles) / data_transformed$Customer.Months
+
+# Display summary of transformed features
+print("Summary of original and transformed features:")
+summary(data_transformed)
+
+# Visualize the impact of transformations
+par(mfrow = c(2, 2))
+hist(data_transformed$Logins, main = "Original Logins", xlab = "Logins")
+hist(data_transformed$Logins_log, main = "Log-transformed Logins", xlab = "Log(Logins + 1)")
+hist(data_transformed$Views, main = "Original Views", xlab = "Views")
+hist(data_transformed$Views_log, main = "Log-transformed Views", xlab = "Log(Views + 1)")
+```
+
+### 2. Feature Selection
+
+```{r correlation_analysis}
+
+# Data validation
+print("Checking for missing values:")
+print(colSums(is.na(data_transformed)))
+
+# Remove any rows with missing values for correlation analysis
+data_for_cor <- data_transformed %>%
+  select(-ID) %>%
+  select_if(is.numeric) %>%
+  na.omit()
+
+# Remove columns with all NA before correlation
+cor_data <- data_for_cor[, colSums(is.na(data_for_cor)) < nrow(data_for_cor)]
+
+if(ncol(cor_data) < 2) {
+  cat("\nNot enough valid features to compute a correlation matrix.\n")
+} else {
+  cor_matrix <- cor(cor_data, use = "pairwise.complete.obs")
+  cor_matrix_rounded <- round(cor_matrix, 1)
+
+  # Convert correlation matrix to long format for ggplot
+  cor_long <- as.data.frame(cor_matrix_rounded) %>%
+    rownames_to_column("Var1") %>%
+    pivot_longer(-Var1, names_to = "Var2", values_to = "Correlation") %>%
+    mutate(Var1 = factor(Var1, levels = rev(rownames(cor_matrix))),
+           Var2 = factor(Var2, levels = colnames(cor_matrix)))
+
+  # Create correlation heatmap using ggplot2 (red=positive, blue=negative, white=0)
+  print(
+    ggplot(cor_long, aes(x = Var2, y = Var1, fill = Correlation)) +
+      geom_tile() +
+      geom_text(aes(label = Correlation), size = 3) +
+      scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                          midpoint = 0, limit = c(-1, 1), space = "Lab",
+                          name = "Correlation") +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+            axis.text.y = element_text(size = 8),
+            axis.title = element_blank(),
+            panel.grid = element_blank()) +
+      coord_fixed() +
+      labs(title = "Correlation Matrix of Features")
+  )
+
+  # Identify highly correlated features
+  cor_threshold <- 0.7
+  high_cor_pairs <- which(abs(cor_matrix) > cor_threshold & upper.tri(cor_matrix), arr.ind = TRUE)
+
+  if(nrow(high_cor_pairs) > 0) {
+    print("Highly correlated feature pairs (correlation > 0.7):")
+    for(i in 1:nrow(high_cor_pairs)) {
+      row_name <- rownames(cor_matrix)[high_cor_pairs[i,1]]
+      col_name <- colnames(cor_matrix)[high_cor_pairs[i,2]]
+      cor_value <- round(cor_matrix[high_cor_pairs[i,1], high_cor_pairs[i,2]], 1)
+      cat(sprintf("%s - %s: %.1f\n", row_name, col_name, cor_value))
+    }
+  } else {
+    print("No highly correlated features found (correlation > 0.7)")
+  }
+}
+
+# Plot correlation with target variable
+target_correlations <- cor_matrix[, "Churn"]
+target_correlations <- target_correlations[order(abs(target_correlations), decreasing = TRUE)]
+
+# Create a bar plot of correlations with target using ggplot2
+target_cor_df <- data.frame(
+  Feature = names(target_correlations),
+  Correlation = target_correlations
+) %>%
+  filter(Feature != "Churn") %>%
+  mutate(Feature = factor(Feature, levels = Feature[order(Correlation)]))
+
+ggplot(target_cor_df, aes(x = Feature, y = Correlation, fill = Correlation > 0)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "steelblue", "FALSE" = "indianred")) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 8),
+        legend.position = "none") +
+  labs(title = "Correlation with Churn",
+       x = "Features",
+       y = "Correlation Coefficient") +
+  geom_text(aes(label = round(Correlation, 1)), 
+            hjust = ifelse(target_cor_df$Correlation > 0, -0.2, 1.2),
+            size = 3)
+
+```
+There is visibly no strong correlation between any feature and churn, so we will proceed with non-linear models, as linear relationships are not present in the data.
+
+
+### 3. Feature Importance
+
+We will now train a simple random forest model to identify the most important features for predicting churn. Random forests can capture complex, non-linear relationships that correlation analysis may miss. This helps us discover which features are most useful for our predictive modeling, even if they don't have a strong linear relationship with churn.
+
+```{r feature_importance}
+# Prepare data for feature importance
+set.seed(123)
+
+# Remove rows with missing values and prepare data
+data_for_importance <- data_transformed %>%
+  select(-ID) %>%
+  select_if(is.numeric) %>%
+  na.omit()
+
+# Print the number of rows after removing missing values
+print(paste("Number of complete cases:", nrow(data_for_importance)))
+
+# Check for infinite values
+print("Checking for infinite values:")
+print(colSums(is.infinite(as.matrix(data_for_importance))))
+
+# Replace infinite values with NA and then remove them
+data_for_importance <- data_for_importance %>%
+  mutate(across(everything(), ~ifelse(is.infinite(.), NA, .))) %>%
+  na.omit()
+
+# Ensure Churn is a factor
+data_for_importance$Churn <- as.factor(data_for_importance$Churn)
+
+# Print data structure before modeling
+print("Data structure before modeling:")
+str(data_for_importance)
+
+# Train a simple random forest model with error handling
+tryCatch({
+  rf_model <- randomForest(Churn ~ ., 
+                          data = data_for_importance,
+                          importance = TRUE,
+                          ntree = 100)
+  
+  # Get feature importance
+  importance_data <- as.data.frame(importance(rf_model))
+  importance_data$Feature <- rownames(importance_data)
+  importance_data <- importance_data[order(importance_data$MeanDecreaseGini, decreasing = TRUE),]
+  
+  # Plot feature importance
+  print(ggplot(importance_data, aes(x = reorder(Feature, MeanDecreaseGini), y = MeanDecreaseGini)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    coord_flip() +
+    theme_minimal() +
+    labs(title = "Feature Importance",
+         x = "Features",
+         y = "Mean Decrease in Gini") +
+    theme(axis.text.y = element_text(size = 8)))
+  
+  # Print top 10 most important features
+  print("Top 10 most important features:")
+  print(head(importance_data[, c("Feature", "MeanDecreaseGini")], 10))
+}, error = function(e) {
+  print("Error in random forest model:")
+  print(e)
+  
+  # Fallback to correlation-based importance
+  print("Using correlation-based importance instead:")
+  cor_importance <- abs(cor(data_for_importance %>% select(-Churn), 
+                          as.numeric(data_for_importance$Churn) - 1))
+  cor_importance <- data.frame(
+    Feature = rownames(cor_importance),
+    Importance = cor_importance[,1]
+  )
+  cor_importance <- cor_importance[order(cor_importance$Importance, decreasing = TRUE),]
+  
+  print(ggplot(cor_importance, aes(x = reorder(Feature, Importance), y = Importance)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    coord_flip() +
+    theme_minimal() +
+    labs(title = "Feature Importance (Correlation-based)",
+         x = "Features",
+         y = "Absolute Correlation with Churn") +
+    theme(axis.text.y = element_text(size = 8)))
+  
+  print("Top 10 most important features (correlation-based):")
+  print(head(cor_importance, 10))
+})
+```
+
+## Next Steps
+
+Now that we have identified the most important features using a random forest model, the next steps are:
+
+1. Use these top predictors to build and tune more advanced machine learning models (such as random forests, gradient boosting, or neural networks) to improve churn prediction.
+2. Perform cross-validation and hyperparameter tuning to optimize model performance.
+3. Evaluate the models using appropriate metrics (such as accuracy, precision, recall, and ROC-AUC).
+4. Interpret the results and, if necessary, iterate on feature engineering or try additional modeling approaches.
+
+This process will help us develop a robust model for predicting customer churn based on the most informative features.
+
+## Feature Engineering Decisions
+
+### Rationale for Transformations
+
+1. **Log Transformations**
+   - Applied to `Logins`, `Views`, and `Blog.Articles` to handle right-skewed distributions
+   - Used `log1p()` to handle zero values appropriately
+
+2. **Ratio Features**
+   - Created `Views_per_Login` and `Blog_per_Login` to capture engagement efficiency
+   - These ratios help identify users who are more engaged relative to their login frequency
+
+3. **Interaction Features**
+   - Created `Support_Score_Interaction` to capture the relationship between support cases and CHI score
+   - Added `Login_View_Interaction` to identify patterns in user engagement
+
+4. **Time-Based Features**
+   - Created `Activity_Score` to normalize engagement metrics by customer tenure
+   - This helps compare engagement levels across customers with different subscription lengths
+
+
+
+## Next Steps
+
+1. **Feature Validation**
+   - Cross-validate the engineered features
+   - Assess feature stability across different time periods
+
+2. **Model Integration**
+   - Prepare features for model training
+   - Document feature requirements for production
+
+## Save Engineered Features for Modeling
+
+```{r save_engineered_features}
+# Save the engineered features (including Churn) to a new CSV for modeling
+engineered_for_modeling <- data_transformed %>% select(-ID)
+write.csv(engineered_for_modeling, "data/EngineeredChurnData.csv", row.names = FALSE)
+cat("Engineered features saved to data/EngineeredChurnData.csv\n")
+```
+

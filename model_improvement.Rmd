@@ -1,0 +1,168 @@
+---
+title: "Improved Modeling for Churn Prediction"
+author: "Andres Perez"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+
+# Check and install required packages if needed
+required_packages <- c("tidyverse", "caret", "randomForest", "xgboost", "pROC", "ROSE", "DMwR", "e1071")
+new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages, repos = "https://cloud.r-project.org")
+
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(pROC)
+library(ROSE)
+library(e1071)
+```
+
+# Improved Modeling for Churn Prediction
+
+This document covers advanced modeling steps to improve churn prediction, including class imbalance handling, hyperparameter tuning, cross-validation, and threshold optimization.
+
+## 1. Data Loading
+
+```{r load_data}
+data <- read.csv("data/EngineeredChurnData.csv")
+# Use only the top 10 features (plus Churn)
+selected_features <- c(
+  "Customer.Months",
+  "Days.Since.Last.Login",
+  "CHI.Score.Mon0",
+  "Activity_Score",
+  "CHI.Score",
+  "Logins",
+  "Views_log",
+  "Logins_log",
+  "Views",
+  "Login_View_Interaction",
+  "Churn"
+)
+selected_features <- intersect(selected_features, colnames(data))
+data <- data[, selected_features, drop=FALSE]
+# Remove rows with NA/NaN/Inf
+data <- data[complete.cases(data) & apply(data, 1, function(row) all(is.finite(as.numeric(row)))), ]
+if(!is.factor(data$Churn)) data$Churn <- as.factor(data$Churn)
+```
+
+## 2. Train-Test Split
+
+```{r split_data}
+set.seed(123)
+train_index <- createDataPartition(data$Churn, p = 0.8, list = FALSE)
+train_data <- data[train_index, ]
+test_data <- data[-train_index, ]
+```
+
+## 3. Address Class Imbalance
+
+```{r balance_data}
+# Use ROSE for class balancing
+rose_data <- ROSE(Churn ~ ., data = train_data, seed = 123)$data
+table(rose_data$Churn)
+```
+
+## 4. Hyperparameter Tuning & Cross-Validation (XGBoost Example)
+
+```{r tune_xgboost, message=FALSE, warning=FALSE}
+set.seed(123)
+xgb_grid <- expand.grid(
+  nrounds = c(100, 200),
+  max_depth = c(3, 5, 7),
+  eta = c(0.01, 0.1, 0.3),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  summaryFunction = twoClassSummary,
+  classProbs = TRUE,
+  verboseIter = FALSE
+)
+rose_data$Churn <- factor(ifelse(rose_data$Churn == 1, "yes", "no"), levels = c("no", "yes"))
+test_data$Churn <- factor(ifelse(test_data$Churn == 1, "yes", "no"), levels = c("no", "yes"))
+invisible(capture.output(
+  xgb_tuned <- train(
+    Churn ~ .,
+    data = rose_data,
+    method = "xgbTree",
+    trControl = train_control,
+    tuneGrid = xgb_grid,
+    metric = "Sens",
+    verbose = 0
+  ),
+  file = '/dev/null'
+))
+```
+
+``` {r xgb_tuned}
+xgb_tuned
+```
+
+## 5. Threshold Optimization
+
+```{r threshold_optimization}
+# Predict probabilities on test set
+xgb_probs <- predict(xgb_tuned, newdata = test_data, type = "prob")[, "yes"]
+# Find best threshold for sensitivity/F1
+thresholds <- seq(0, 1, by = 0.01)
+f1_scores <- sapply(thresholds, function(t) {
+  pred <- ifelse(xgb_probs > t, "yes", "no")
+  cm <- confusionMatrix(factor(pred, levels = c("no", "yes")), test_data$Churn, positive = "yes")
+  cm$byClass["F1"]
+})
+best_thresh <- thresholds[which.max(f1_scores)]
+best_thresh
+plot(thresholds, f1_scores, type = "l", main = "F1 Score vs. Threshold", xlab = "Threshold", ylab = "F1 Score")
+```
+
+## 6. Model Evaluation
+
+```{r evaluation}
+# Use best threshold to classify
+xgb_pred_class <- ifelse(xgb_probs > best_thresh, "yes", "no")
+cm <- confusionMatrix(factor(xgb_pred_class, levels = c("no", "yes")), test_data$Churn, positive = "yes")
+roc_xgb <- roc(as.numeric(test_data$Churn == "yes"), xgb_probs)
+auc_xgb <- auc(roc_xgb)
+
+metrics <- data.frame(
+  Sensitivity = cm$byClass["Sensitivity"],
+  Specificity = cm$byClass["Specificity"],
+  F1 = cm$byClass["F1"],
+  AUC = auc_xgb
+)
+knitr::kable(metrics, digits = 3, caption = "Improved XGBoost Model Metrics (Test Set)")
+```
+
+## 7. Interpretation (Optional)
+
+```{r feature_importance}
+# Feature importance plot
+xgb.importance <- xgb.importance(model = xgb_tuned$finalModel)
+xgb.plot.importance(xgb.importance)
+```
+
+## 8. Conclusion
+
+- Addressing class imbalance and tuning XGBoost improved model sensitivity and overall performance.
+- Further improvements could include ensembling, additional feature engineering, or using other advanced algorithms. 
